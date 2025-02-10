@@ -10,11 +10,24 @@ package main
 // Please do not change this file.
 //
 
-import "6.5840/mr"
-import "plugin"
-import "os"
-import "fmt"
-import "log"
+import (
+	"fmt"
+	"log"
+	"os"
+	"plugin"
+
+	"6.5840/mr"
+)
+
+// 定义空的 mapf 函数
+func emptyMapf(filename string, contents string) []mr.KeyValue {
+	return []mr.KeyValue{}
+}
+
+// 定义空的 reducef 函数
+func emptyReducef(key string, values []string) string {
+	return ""
+}
 
 func main() {
 	if len(os.Args) != 2 {
@@ -23,8 +36,8 @@ func main() {
 	}
 
 	mapf, reducef := loadPlugin(os.Args[1])
-
 	mr.Worker(mapf, reducef)
+	// mr.Worker(mapf, reducef)
 }
 
 // load the application Map and Reduce functions
