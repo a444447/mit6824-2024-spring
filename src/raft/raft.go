@@ -49,6 +49,14 @@ type ApplyMsg struct {
 	SnapshotIndex int
 }
 
+type NodeState int
+
+const (
+	Leader = iota
+	Follower
+	Candidate
+)
+
 type LogEntry struct {
 	Term    int
 	Command interface{}
@@ -89,6 +97,7 @@ type Raft struct {
 	matchIndex []int
 
 	//其他变量
+	state          NodeState
 	electionTimer  *time.Time
 	heartbeatTimer *time.Time
 }
@@ -97,10 +106,72 @@ type Raft struct {
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
 
-	var term int
-	var isleader bool
-	// Your code here (3A).
-	return term, isleader
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	return rf.currentTerm, rf.state == Leader
+}
+
+func (rf *Raft) ChangeState(state NodeState) {
+	if rf.state == state {
+		return
+	}
+	rf.state = state
+	switch state {
+	case Follower:
+		rf.resetElectionTimer()
+		rf.voeteFor = -1
+	case Candidate:
+
+	case Leader:
+
+	}
+}
+
+func (rf *Raft) resetElectionTimer() {
+	// Implementation to reset the election timer
+}
+
+func (rf *Raft) resetHeartbeatTimer() {
+	// Implementation to reset the heartbeat timer
+}
+
+func (rf *Raft) boardCastHeartbeats() {
+	//当成为leader后，立马向所有peers发送罅隙
+	for peer := range rf.peers {
+		if peer == rf.me {
+			continue
+		}
+
+	}
+}
+
+func (rf *Raft) sendHeartbeat(peer int) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	args := &AppendEntriesArgs{
+		Term:         rf.currentTerm,
+		LeaderId:     rf.me,
+		PrevLogIndex: rf.nextIndex[peer] - 1,
+		PrevLogTerm:  rf.logs[rf.nextIndex[peer]-1].Term,
+		Entries:      []LogEntry{},
+		LeaderCommit: rf.commitIndex,
+	}
+	reply := &AppendEntriesReply{}
+	if rf.sendAppendEntries(peer, args, reply) {
+		if reply.Term > rf.currentTerm {
+			rf.currentTerm = reply.Term
+			rf.ChangeState(Follower)
+			return
+		}
+
+		if reply.Success {
+			rf.nextIndex[peer] = args.PrevLogIndex + len(args.Entries) + 1
+			rf.matchIndex[peer] = rf.nextIndex[peer] - 1
+		} else {
+			rf.nextIndex[peer]--
+		}
+	}
 }
 
 // save Raft's persistent state to stable storage,
@@ -174,6 +245,33 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 func (rf *Raft) StartElection() {
 	rf.voeteFor = rf.me //节点选举计时器超时开始选举，并且一定会投票给自己
+	args := rf.genRequestVoteArgs()
+	votesCnt := 1
+	for peer := range rf.peers {
+		if peer == rf.me {
+			continue
+		} else {
+			go func(peer int) {
+				reply := &RequestVoteReply{}
+				if rf.sendRequestVote(peer, args, reply) {
+					rf.mu.Lock()
+					defer rf.mu.Unlock()
+					if reply.Term == rf.currentTerm && rf.state == Candidate {
+						if reply.VoteGranted {
+							votesCnt += 1
+						}
+						if votesCnt > len(rf.peers)+1 { //大部分都同意了，当选leader
+							rf.ChangeState(Leader)
+						} else if reply.Term > rf.currentTerm {
+							rf.ChangeState(Follower)
+						}
+					}
+
+				}
+			}(peer)
+		}
+	}
+
 }
 
 // the tester doesn't halt goroutines created by Raft after each test,

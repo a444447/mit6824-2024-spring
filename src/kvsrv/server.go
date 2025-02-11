@@ -46,8 +46,7 @@ func (kv *KVServer) Append(args *PutAppendArgs, reply *PutAppendReply) {
 
 func StartKVServer() *KVServer {
 	kv := new(KVServer)
-
 	// You may need initialization code here.
-
+	kv.kvmap = make(map[string]string)
 	return kv
 }
