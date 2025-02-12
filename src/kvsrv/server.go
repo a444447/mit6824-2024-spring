@@ -17,7 +17,8 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 type KVServer struct {
 	mu sync.Mutex
 	// Your definitions here.
-	kvmap map[string]string
+	kvmap  map[string]string
+	record sync.Map
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
@@ -29,19 +30,43 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 
 func (kv *KVServer) Put(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
+	if args.Type == Report {
+		kv.record.Delete(args.MessageID)
+		return
+	}
+	res, isExisted := kv.record.Load(args.MessageID)
+	if isExisted {
+		reply.Value = res.(string)
+		return
+	}
 	kv.mu.Lock()
-	defer kv.mu.Unlock()
-
+	old := kv.kvmap[args.Key]
 	kv.kvmap[args.Key] = args.Value
+	reply.Value = old
+	kv.mu.Unlock()
+
+	kv.record.Store(args.MessageID, old)
 }
 
 func (kv *KVServer) Append(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
+	if args.Type == Report {
+		kv.record.Delete(args.MessageID)
+		return
+	}
+	res, isExisted := kv.record.Load(args.MessageID)
+	if isExisted {
+		reply.Value = res.(string)
+		return
+	}
+
 	kv.mu.Lock()
-	defer kv.mu.Unlock()
 	oldV := kv.kvmap[args.Key]
 	kv.kvmap[args.Key] += args.Value
 	reply.Value = oldV
+	kv.mu.Unlock()
+
+	kv.record.Store(args.MessageID, oldV)
 }
 
 func StartKVServer() *KVServer {
