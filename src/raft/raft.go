@@ -57,6 +57,9 @@ const (
 	Candidate
 )
 
+const baseElectionTimeout = 300
+const baseHeartbeatTimeout = 150
+
 type LogEntry struct {
 	Term    int
 	Command interface{}
@@ -85,7 +88,7 @@ type Raft struct {
 
 	//持久化存储的状态
 	currentTerm int
-	voeteFor    int
+	voteFor     int
 	logs        []LogEntry
 
 	//所有服务器上的非持久化状态
@@ -98,8 +101,8 @@ type Raft struct {
 
 	//其他变量
 	state          NodeState
-	electionTimer  *time.Time
-	heartbeatTimer *time.Time
+	electionTimer  *time.Timer
+	heartbeatTimer *time.Timer
 }
 
 // return currentTerm and whether this server
@@ -120,9 +123,10 @@ func (rf *Raft) ChangeState(state NodeState) {
 	switch state {
 	case Follower:
 		rf.resetElectionTimer()
-		rf.voeteFor = -1
 	case Candidate:
-
+		rf.currentTerm += 1
+		rf.StartElection()
+		rf.resetElectionTimer()
 	case Leader:
 
 	}
@@ -130,6 +134,7 @@ func (rf *Raft) ChangeState(state NodeState) {
 
 func (rf *Raft) resetElectionTimer() {
 	// Implementation to reset the election timer
+
 }
 
 func (rf *Raft) resetHeartbeatTimer() {
@@ -141,6 +146,8 @@ func (rf *Raft) boardCastHeartbeats() {
 	for peer := range rf.peers {
 		if peer == rf.me {
 			continue
+		} else {
+			rf.sendHeartbeat(peer)
 		}
 
 	}
@@ -244,7 +251,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 }
 
 func (rf *Raft) StartElection() {
-	rf.voeteFor = rf.me //节点选举计时器超时开始选举，并且一定会投票给自己
+	rf.voteFor = rf.me //节点选举计时器超时开始选举，并且一定会投票给自己
 	args := rf.genRequestVoteArgs()
 	votesCnt := 1
 	for peer := range rf.peers {
@@ -264,6 +271,8 @@ func (rf *Raft) StartElection() {
 							rf.ChangeState(Leader)
 						} else if reply.Term > rf.currentTerm {
 							rf.ChangeState(Follower)
+							rf.currentTerm = reply.Term
+							rf.voteFor = -1
 						}
 					}
 
@@ -301,8 +310,18 @@ func (rf *Raft) ticker() {
 
 		// pause for a random amount of time between 50 and 350
 		// milliseconds.
+		select {
+		case <-rf.electionTimer.C:
+			rf.mu.Lock()
+			rf.ChangeState(Candidate)
+			rf.mu.Unlock()
+		case <-rf.heartbeatTimer.C:
+			rf.mu.Lock()
+		}
+
 		ms := 50 + (rand.Int63() % 300)
 		time.Sleep(time.Duration(ms) * time.Millisecond)
+
 	}
 }
 
