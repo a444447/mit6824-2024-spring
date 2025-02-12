@@ -19,7 +19,7 @@ package raft
 
 import (
 	//	"bytes"
-	"math/rand"
+
 	"sync"
 	"sync/atomic"
 	"time"
@@ -56,9 +56,6 @@ const (
 	Follower
 	Candidate
 )
-
-const baseElectionTimeout = 300
-const baseHeartbeatTimeout = 150
 
 type LogEntry struct {
 	Term    int
@@ -126,7 +123,7 @@ func (rf *Raft) ChangeState(state NodeState) {
 	case Candidate:
 		rf.currentTerm += 1
 		rf.StartElection()
-		rf.resetElectionTimer()
+		rf.electionTimer.Reset(RandomElectionTimeout())
 	case Leader:
 
 	}
@@ -172,13 +169,53 @@ func (rf *Raft) sendHeartbeat(peer int) {
 			return
 		}
 
-		if reply.Success {
-			rf.nextIndex[peer] = args.PrevLogIndex + len(args.Entries) + 1
-			rf.matchIndex[peer] = rf.nextIndex[peer] - 1
-		} else {
-			rf.nextIndex[peer]--
-		}
+		// if reply.Success {
+		// 	rf.nextIndex[peer] = args.PrevLogIndex + len(args.Entries) + 1
+		// 	rf.matchIndex[peer] = rf.nextIndex[peer] - 1
+		// } else {
+		// 	rf.nextIndex[peer]--
+		// }
 	}
+}
+
+func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	defer DPrintf("{Node %v}'s state is {state %v, term %v}} after processing RequestVote,  RequestVoteArgs %v and RequestVoteReply %v ", rf.me, rf.state, rf.currentTerm, args, reply)
+	if args.Term < rf.currentTerm || (args.Term == rf.currentTerm && rf.voteFor != -1 && rf.voteFor != args.CandidateId) {
+		reply.Term = rf.currentTerm
+		reply.VoteGranted = false
+		return
+	}
+	if args.Term > rf.currentTerm {
+		rf.ChangeState(Follower)
+		rf.currentTerm, rf.voteFor = args.Term, -1
+	}
+	rf.voteFor = args.CandidateId
+	rf.electionTimer.Reset(RandomElectionTimeout())
+	reply.Term = rf.currentTerm
+	reply.VoteGranted = true
+
+}
+
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	if args.Term < rf.currentTerm {
+		reply.Term = rf.currentTerm
+		reply.Success = false
+		return
+	}
+	if args.Term > rf.currentTerm {
+		rf.currentTerm = args.Term
+		rf.voteFor = -1
+	}
+
+	rf.ChangeState(Follower)
+	rf.electionTimer.Reset(RandomElectionTimeout())
+	reply.Term, reply.Success = rf.currentTerm, true
+
 }
 
 // save Raft's persistent state to stable storage,
@@ -254,21 +291,27 @@ func (rf *Raft) StartElection() {
 	rf.voteFor = rf.me //节点选举计时器超时开始选举，并且一定会投票给自己
 	args := rf.genRequestVoteArgs()
 	votesCnt := 1
+	DPrintf("{Node %v} starts election with RequestVoteArgs %v", rf.me, args)
 	for peer := range rf.peers {
 		if peer == rf.me {
 			continue
 		} else {
 			go func(peer int) {
 				reply := &RequestVoteReply{}
+				DPrintf("{Node %v State %v} send vote request to {Node %v} at Term {%v}", rf.me, rf.state, peer, rf.currentTerm)
 				if rf.sendRequestVote(peer, args, reply) {
 					rf.mu.Lock()
 					defer rf.mu.Unlock()
+					DPrintf("{Node %v} receives RequestVoteReply %v from {Node %v} after sending RequestVoteArgs %v", rf.me, reply, peer, args)
 					if reply.Term == rf.currentTerm && rf.state == Candidate {
 						if reply.VoteGranted {
 							votesCnt += 1
+							DPrintf("{Node %v} vote++, now is %v", rf.me, votesCnt)
 						}
-						if votesCnt > len(rf.peers)+1 { //大部分都同意了，当选leader
+						if votesCnt > (len(rf.peers)+1)/2 { //大部分都同意了，当选leader
+							DPrintf("{Node %v} become leader", rf.me)
 							rf.ChangeState(Leader)
+							rf.boardCastHeartbeats()
 						} else if reply.Term > rf.currentTerm {
 							rf.ChangeState(Follower)
 							rf.currentTerm = reply.Term
@@ -317,10 +360,13 @@ func (rf *Raft) ticker() {
 			rf.mu.Unlock()
 		case <-rf.heartbeatTimer.C:
 			rf.mu.Lock()
+			if rf.state == Leader {
+				//发送心跳给其他peers
+				rf.boardCastHeartbeats()
+				rf.heartbeatTimer.Reset(StableHeartbeatTimeout())
+			}
+			rf.mu.Unlock()
 		}
-
-		ms := 50 + (rand.Int63() % 300)
-		time.Sleep(time.Duration(ms) * time.Millisecond)
 
 	}
 }
@@ -340,7 +386,18 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
+	rf.dead = 0
+	rf.currentTerm = 0
+	rf.voteFor = -1
+	rf.logs = make([]LogEntry, 1)
+	rf.commitIndex = 0
+	rf.lastApplied = 0
+	rf.nextIndex = make([]int, len(peers))
+	rf.matchIndex = make([]int, len(peers))
 
+	rf.electionTimer = time.NewTimer(RandomElectionTimeout())
+	rf.heartbeatTimer = time.NewTimer(StableHeartbeatTimeout())
+	rf.state = Follower
 	// Your initialization code here (3A, 3B, 3C).
 
 	// initialize from state persisted before a crash

@@ -26,11 +26,6 @@ func (rf *Raft) genRequestVoteArgs() *RequestVoteArgs {
 	return args
 }
 
-// example RequestVote RPC handler.
-func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
-	// Your code here (3A, 3B).
-}
-
 // example code to send a RequestVote RPC to a server.
 // server is the index of the target server in rf.peers[].
 // expects RPC arguments in args.
@@ -77,10 +72,6 @@ type AppendEntriesReply struct {
 	Success       bool
 	ConflictIndex int
 	ConflictTerm  int
-}
-
-func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {

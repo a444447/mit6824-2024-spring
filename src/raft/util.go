@@ -3,15 +3,28 @@ package raft
 import (
 	"fmt"
 	"log"
+	"math/rand"
+	"time"
 )
 
 // Debugging
-const Debug = false
+const Debug = true
+
+const baseElectionTimeout = 300
+const baseHeartbeatTimeout = 150
 
 func DPrintf(format string, a ...interface{}) {
 	if Debug {
 		log.Printf(format, a...)
 	}
+}
+
+func RandomElectionTimeout() time.Duration {
+	return time.Duration(baseElectionTimeout+rand.Intn(baseElectionTimeout)) * time.Millisecond
+}
+
+func StableHeartbeatTimeout() time.Duration {
+	return time.Duration(baseHeartbeatTimeout) * time.Millisecond
 }
 
 func (args RequestVoteArgs) String() string {
