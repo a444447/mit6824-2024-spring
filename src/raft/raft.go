@@ -108,7 +108,7 @@ func (rf *Raft) GetState() (int, bool) {
 
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-
+	DPrintf("{Node %v} Call GetState(): {Term %v}, {isLeader %v}", rf.me, rf.currentTerm, rf.state == Leader)
 	return rf.currentTerm, rf.state == Leader
 }
 
@@ -120,12 +120,11 @@ func (rf *Raft) ChangeState(state NodeState) {
 	switch state {
 	case Follower:
 		rf.resetElectionTimer()
+		rf.heartbeatTimer.Stop()
 	case Candidate:
-		rf.currentTerm += 1
-		rf.StartElection()
-		rf.electionTimer.Reset(RandomElectionTimeout())
 	case Leader:
-
+		rf.electionTimer.Stop()
+		rf.heartbeatTimer.Reset(StableHeartbeatTimeout())
 	}
 }
 
@@ -144,7 +143,8 @@ func (rf *Raft) boardCastHeartbeats() {
 		if peer == rf.me {
 			continue
 		} else {
-			rf.sendHeartbeat(peer)
+			DPrintf("{Node %v} send heartbeat to {Node %v}", rf.me, peer)
+			go rf.sendHeartbeat(peer)
 		}
 
 	}
@@ -154,17 +154,16 @@ func (rf *Raft) sendHeartbeat(peer int) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	args := &AppendEntriesArgs{
-		Term:         rf.currentTerm,
-		LeaderId:     rf.me,
-		PrevLogIndex: rf.nextIndex[peer] - 1,
-		PrevLogTerm:  rf.logs[rf.nextIndex[peer]-1].Term,
-		Entries:      []LogEntry{},
-		LeaderCommit: rf.commitIndex,
+		Term:     rf.currentTerm,
+		LeaderId: rf.me,
+		Entries:  []LogEntry{},
 	}
 	reply := &AppendEntriesReply{}
+	DPrintf("{Node %v} send to {Node %v} with %v", rf.me, peer, reply)
 	if rf.sendAppendEntries(peer, args, reply) {
 		if reply.Term > rf.currentTerm {
 			rf.currentTerm = reply.Term
+			rf.voteFor = -1
 			rf.ChangeState(Follower)
 			return
 		}
@@ -181,7 +180,6 @@ func (rf *Raft) sendHeartbeat(peer int) {
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	defer DPrintf("{Node %v}'s state is {state %v, term %v}} after processing RequestVote,  RequestVoteArgs %v and RequestVoteReply %v ", rf.me, rf.state, rf.currentTerm, args, reply)
 	if args.Term < rf.currentTerm || (args.Term == rf.currentTerm && rf.voteFor != -1 && rf.voteFor != args.CandidateId) {
 		reply.Term = rf.currentTerm
 		reply.VoteGranted = false
@@ -195,13 +193,14 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.electionTimer.Reset(RandomElectionTimeout())
 	reply.Term = rf.currentTerm
 	reply.VoteGranted = true
+	DPrintf("{Node %v}'s state is {state %v, term %v}} after processing RequestVote,  RequestVoteArgs %v and RequestVoteReply %v ", rf.me, rf.state, rf.currentTerm, args, reply)
 
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-
+	defer DPrintf("{Node %v}'s state is {state %v, term %v}} after processing AppendEntries,  AppendEntriesArgs %v and AppendEntriesReply %v ", rf.me, rf.state, rf.currentTerm, args, reply)
 	if args.Term < rf.currentTerm {
 		reply.Term = rf.currentTerm
 		reply.Success = false
@@ -357,6 +356,10 @@ func (rf *Raft) ticker() {
 		case <-rf.electionTimer.C:
 			rf.mu.Lock()
 			rf.ChangeState(Candidate)
+			rf.currentTerm += 1
+			DPrintf("{Node %v} now become candidate, term is %v", rf.me, rf.currentTerm)
+			rf.StartElection()
+			rf.electionTimer.Reset(RandomElectionTimeout())
 			rf.mu.Unlock()
 		case <-rf.heartbeatTimer.C:
 			rf.mu.Lock()
