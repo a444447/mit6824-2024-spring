@@ -8,7 +8,7 @@ import (
 )
 
 // Debugging
-const Debug = true
+const Debug = false
 
 const baseElectionTimeout = 300
 const baseHeartbeatTimeout = 150

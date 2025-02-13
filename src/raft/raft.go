@@ -73,7 +73,7 @@ func (rf *Raft) getFirstLog() LogEntry {
 
 // A Go object implementing a single Raft peer.
 type Raft struct {
-	mu        sync.Mutex          // Lock to protect shared access to this peer's state
+	mu        sync.RWMutex        // Lock to protect shared access to this peer's state
 	peers     []*labrpc.ClientEnd // RPC end points of all peers
 	persister *Persister          // Object to hold this peer's persisted state
 	me        int                 // this peer's index into peers[]
@@ -106,8 +106,8 @@ type Raft struct {
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
 
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
+	rf.mu.RLock()
+	defer rf.mu.RUnlock()
 	DPrintf("{Node %v} Call GetState(): {Term %v}, {isLeader %v}", rf.me, rf.currentTerm, rf.state == Leader)
 	return rf.currentTerm, rf.state == Leader
 }
@@ -137,17 +137,51 @@ func (rf *Raft) resetHeartbeatTimer() {
 	// Implementation to reset the heartbeat timer
 }
 
-func (rf *Raft) boardCastHeartbeats() {
+func (rf *Raft) boardCastHeartbeats(isHeartbeat bool) {
 	//当成为leader后，立马向所有peers发送罅隙
 	for peer := range rf.peers {
 		if peer == rf.me {
 			continue
 		} else {
-			DPrintf("{Node %v} send heartbeat to {Node %v} {Term %v}", rf.me, peer, rf.currentTerm)
-			go rf.sendHeartbeat(peer)
+			if isHeartbeat {
+				DPrintf("{Node %v} send heartbeat to {Node %v} {Term %v}", rf.me, peer, rf.currentTerm)
+				go rf.sendHeartbeat(peer)
+			} else {
+				go rf.sendLogs(peer)
+			}
+
 		}
 
 	}
+}
+
+func (rf *Raft) sendLogs(peer int) {
+	prevLogIndex := rf.nextIndex[peer] - 1
+	var prevLogTerm int
+	if prevLogIndex >= 0 {
+		prevLogTerm = rf.logs[prevLogIndex].Term
+	}
+	entries := rf.logs[rf.nextIndex[peer]:]
+	args := &AppendEntriesArgs{
+		Term:         rf.currentTerm,
+		LeaderId:     rf.me,
+		PrevLogIndex: prevLogIndex,
+		PrevLogTerm:  prevLogTerm,
+		Entries:      entries,
+		LeaderCommit: rf.commitIndex,
+	}
+	reply := &AppendEntriesReply{}
+	if rf.sendAppendEntries(peer, args, reply) {
+		rf.handleAppendEntriesResponse(peer, args, reply)
+	}
+}
+
+func (rf *Raft) handleAppendEntriesResponse(peer int, args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	//首先检验term之间的关系
+	if 
+
 }
 
 func (rf *Raft) sendHeartbeat(peer int) {
@@ -204,6 +238,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	defer rf.mu.Unlock()
 	defer DPrintf("{Node %v}'s state is {state %v, term %v}} after processing AppendEntries,  AppendEntriesArgs %v and AppendEntriesReply %v ", rf.me, rf.state, rf.currentTerm, args, reply)
 	if args.Term < rf.currentTerm {
+		//首先检查term规则
 		reply.Term = rf.currentTerm
 		reply.Success = false
 		return
@@ -215,6 +250,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	rf.ChangeState(Follower)
 	rf.electionTimer.Reset(RandomElectionTimeout())
+
+	//开始追加日志
+	
 	reply.Term, reply.Success = rf.currentTerm, true
 
 }
@@ -279,13 +317,26 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 // term. the third return value is true if this server believes it is
 // the leader.
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
-	isLeader := true
+	//返回值中，第一个值是如果command提交被committed的话会处于的index,第二个值是term,第三个bool是server是否认为自己是leader
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	//首先检查是不是leader,Start只允许leader调用
+	if rf.state != Leader {
+		return -1, -1, false
+	}
+	//leader将command添加到自己的日志中
+	appendLogIndex := rf.getLastLog().Index + 1
+	rf.logs = append(rf.logs, LogEntry{
+		Term:    rf.currentTerm,
+		Command: command,
+		Index:   appendLogIndex,
+	})
 
-	// Your code here (3B).
-
-	return index, term, isLeader
+	rf.matchIndex[rf.me] = appendLogIndex
+	rf.nextIndex[rf.me] = appendLogIndex + 1
+	DPrintf("{Node %v} starts agreement on a new log entry with command %v in term %v", rf.me, command, rf.currentTerm)
+	rf.boardCastHeartbeats(false)
+	return appendLogIndex, rf.currentTerm, true
 }
 
 func (rf *Raft) StartElection() {
