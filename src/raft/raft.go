@@ -143,7 +143,7 @@ func (rf *Raft) boardCastHeartbeats() {
 		if peer == rf.me {
 			continue
 		} else {
-			DPrintf("{Node %v} send heartbeat to {Node %v}", rf.me, peer)
+			DPrintf("{Node %v} send heartbeat to {Node %v} {Term %v}", rf.me, peer, rf.currentTerm)
 			go rf.sendHeartbeat(peer)
 		}
 
@@ -151,16 +151,18 @@ func (rf *Raft) boardCastHeartbeats() {
 }
 
 func (rf *Raft) sendHeartbeat(peer int) {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
 	args := &AppendEntriesArgs{
 		Term:     rf.currentTerm,
 		LeaderId: rf.me,
 		Entries:  []LogEntry{},
 	}
 	reply := &AppendEntriesReply{}
-	DPrintf("{Node %v} send to {Node %v} with %v", rf.me, peer, reply)
+	DPrintf("{Node %v} send to {Node %v} with %v", rf.me, peer, args)
 	if rf.sendAppendEntries(peer, args, reply) {
+		//注意锁的位置，如果把这个锁放在sendHeartbeat开头，假设A peer disconnect，所以rf.sendAppendEntries不会返回，但是此时
+		//向B peer发送heartbeat的请求也会卡在开头，因为他竞争锁
+		rf.mu.Lock()
+		defer rf.mu.Unlock()
 		if reply.Term > rf.currentTerm {
 			rf.currentTerm = reply.Term
 			rf.voteFor = -1
@@ -307,8 +309,8 @@ func (rf *Raft) StartElection() {
 							votesCnt += 1
 							DPrintf("{Node %v} vote++, now is %v", rf.me, votesCnt)
 						}
-						if votesCnt > (len(rf.peers)+1)/2 { //大部分都同意了，当选leader
-							DPrintf("{Node %v} become leader", rf.me)
+						if 2*votesCnt > len(rf.peers) { //大部分都同意了，当选leader
+							DPrintf("{Node %v} become leader, {Term %v}", rf.me, rf.currentTerm)
 							rf.ChangeState(Leader)
 							rf.boardCastHeartbeats()
 						} else if reply.Term > rf.currentTerm {
