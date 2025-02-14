@@ -252,6 +252,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.electionTimer.Reset(RandomElectionTimeout())
 
 	//开始追加日志
+	if args.PrevLogIndex >=0 && (args.PrevLogIndex >= len(rf.logs) || rf.logs[args.PrevLogIndex].Term != args.Term) {
+		
+	}
 	
 	reply.Term, reply.Success = rf.currentTerm, true
 
