@@ -20,12 +20,14 @@ package raft
 import (
 	//	"bytes"
 
+	"bytes"
 	"math"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	//	"6.5840/labgob"
+	"6.5840/labgob"
 	"6.5840/labrpc"
 )
 
@@ -111,6 +113,13 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// raftstate := w.Bytes()
 	// rf.persister.Save(raftstate, nil)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.log)
+	raftstate := w.Bytes()
+	rf.persister.Save(raftstate, nil)
 }
 
 // restore previously persisted state.
@@ -131,6 +140,21 @@ func (rf *Raft) readPersist(data []byte) {
 	//   rf.xxx = xxx
 	//   rf.yyy = yyy
 	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+
+	var votedFor int
+	var currentTerm int
+	var log []Entry
+	if d.Decode(&votedFor) != nil ||
+		d.Decode(&currentTerm) != nil ||
+		d.Decode(&log) != nil {
+		DPrintf("readPersist failed\n")
+	} else {
+		rf.votedFor = votedFor
+		rf.currentTerm = currentTerm
+		rf.log = log
+	}
 }
 
 // the service says it has created a snapshot that has
@@ -158,6 +182,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.votedFor = -1
 		rf.currentTerm = args.Term
 		rf.role = Follower
+		rf.persist()
 	}
 
 	if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
@@ -174,6 +199,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			rf.mu.Unlock()
 			reply.VoteGranted = true
 			DPrintf("server %v 同意向 server %v投票\n\targs= %+v\n", rf.me, args.CandidateId, args)
+			rf.persist()
 			return
 		}
 	} else {
@@ -200,6 +226,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.currentTerm = args.Term
 		rf.votedFor = -1
 		rf.role = Follower
+		rf.persist()
 	}
 
 	if len(args.Entries) == 0 {
@@ -220,7 +247,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.Term = rf.log[args.PrevLogIndex].Term
 		i := args.PrevLogIndex
 		for rf.log[i].Term == args.PrevLogTerm {
-			i--
+			i -= 1
 		}
 		reply.XIndex = i + 1
 		isConflict = true
@@ -231,22 +258,23 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.Success = false
 		return
 	}
-	if args.PrevLogIndex >= len(rf.log) || rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
-		reply.Term = rf.currentTerm
-		reply.Success = false
-		return
-	}
+	// if args.PrevLogIndex >= len(rf.log) || rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+	// 	reply.Term = rf.currentTerm
+	// 	reply.Success = false
+	// 	return
+	// }
 
 	// 3. If an existing entry conflicts with a new one (same index
 	// but different terms), delete the existing entry and all that
 	// follow it (§5.3)
-	// if len(args.Entries) != 0 && len(rf.log) > args.PrevLogIndex+1 && rf.log[args.PrevLogIndex+1].Term != args.Entries[0].Term {
-	// 	DPrintf("server %v 的log与args发生冲突, 进行移除\n", rf.me)
-	// 	rf.log = rf.log[:args.PrevLogIndex+1]
-	// }
+	if len(args.Entries) != 0 && len(rf.log) > args.PrevLogIndex+1 {
+		DPrintf("server %v 的log与args发生冲突, 进行移除\n", rf.me)
+		rf.log = rf.log[:args.PrevLogIndex+1]
+	}
 	// 4. Append any new entries not already in the log
 	// 补充apeend的业务
 	rf.log = append(rf.log, args.Entries...)
+	rf.persist()
 	if len(args.Entries) != 0 {
 		// DPrintf("server %v 成功进行apeend, log: %+v\n", rf.me, rf.log)
 		DPrintf("server %v 成功进行apeend\n", rf.me)
@@ -320,6 +348,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	}
 	newEntry := &Entry{Term: rf.currentTerm, Command: command}
 	rf.log = append(rf.log, *newEntry)
+	rf.persist()
 	return len(rf.log) - 1, rf.currentTerm, true
 }
 
@@ -424,6 +453,7 @@ func (rf *Raft) handleHeartbeat(peer int, args *AppendEntriesArgs) {
 		rf.votedFor = -1
 		rf.role = Follower
 		rf.elecTimer.Reset(GetRandomElecInterval())
+		rf.persist()
 		return
 	}
 
@@ -527,6 +557,7 @@ func (rf *Raft) GetVoteAnswer(server int, args *RequestVoteArgs) bool {
 		rf.currentTerm = reply.Term
 		rf.votedFor = -1
 		rf.role = Follower
+		rf.persist()
 	}
 	return reply.VoteGranted
 }

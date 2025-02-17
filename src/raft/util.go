@@ -20,7 +20,7 @@ func DPrintf(format string, a ...interface{}) {
 }
 
 func GetRandomElecInterval() time.Duration {
-	return time.Duration(baseElecInterval+rand.Intn(baseElecInterval)) * time.Millisecond
+	return time.Duration(baseElecInterval+rand.Intn(150)) * time.Millisecond
 }
 
 func GetStableHeartbeatInterval() time.Duration {
