@@ -56,6 +56,20 @@ type Entry struct {
 	Term    int
 }
 
+// 阅读论文可知, 当Leader发现Follower要求回退的日志已经被SnapShot截断时, 需要发生InstallSnapshot RPC
+type InstallSnapshotArgs struct {
+	Term              int         // leader’s term
+	LeaderId          int         // so follower can redirect clients
+	LastIncludedIndex int         // the snapshot replaces all entries up through and including this index
+	LastIncludedTerm  int         // term of lastIncludedIndex snapshot file
+	Data              []byte      //[] raw bytes of the snapshot chunk
+	LastIncludedCmd   interface{} // 自己新加的字段, 用于在0处占位
+}
+
+type InstallSnapshotReply struct {
+	Term int // currentTerm, for leader to update itself
+}
+
 // A Go object implementing a single Raft peer.
 type Raft struct {
 	mu        sync.RWMutex        // Lock to protect shared access to this peer's state
@@ -84,6 +98,23 @@ type Raft struct {
 	role           int
 	voteCnt        int
 	muVote         sync.Mutex
+
+	//snapshot
+	snapShot          []byte //快照
+	lastIncludedIndex int    //快照中最高索引
+	lastIncludedTerm  int    //快照中最高term
+}
+
+// 定义一个转换函数
+// 规定virtual idx是全局真实递增的索引
+// 规定real idx是我们实际访问rf.log用的索引
+// 规定我们除了访问rf.log使用real idx外，其他地方都是virtual idx
+func (rf *Raft) RealLogIdx(vIdx int) int {
+	return vIdx - rf.lastIncludedIndex
+}
+
+func (rf *Raft) VirtualLogIdx(rIdx int) int {
+	return rIdx + rf.lastIncludedIndex
 }
 
 // return currentTerm and whether this server
@@ -117,6 +148,10 @@ func (rf *Raft) persist() {
 	e.Encode(rf.votedFor)
 	e.Encode(rf.currentTerm)
 	e.Encode(rf.log)
+
+	//3D
+	e.Encode(rf.lastIncludedIndex)
+	e.Encode(rf.lastIncludedTerm)
 	raftstate := w.Bytes()
 	rf.persister.Save(raftstate, nil)
 }
@@ -145,15 +180,36 @@ func (rf *Raft) readPersist(data []byte) {
 	var votedFor int
 	var currentTerm int
 	var log []Entry
+	var lastIncludedIndex int
+	var lastIncludedTerm int
 	if d.Decode(&votedFor) != nil ||
 		d.Decode(&currentTerm) != nil ||
-		d.Decode(&log) != nil {
-		DPrintf("readPersist failed\n")
+		d.Decode(&log) != nil ||
+		d.Decode(&lastIncludedIndex) != nil ||
+		d.Decode(&lastIncludedTerm) != nil {
+		DPrintf("server %v readPersist failed\n", rf.me)
 	} else {
+		// 2C
 		rf.votedFor = votedFor
 		rf.currentTerm = currentTerm
 		rf.log = log
+		// 2D
+		rf.lastIncludedIndex = lastIncludedIndex
+		rf.lastIncludedTerm = lastIncludedTerm
+
+		rf.commitIndex = lastIncludedIndex
+		rf.lastApplied = lastIncludedIndex
+		DPrintf("server %v  readPersist 成功\n", rf.me)
 	}
+}
+
+func (rf *Raft) readSnapshot(data []byte) {
+	if len(data) == 0 {
+		DPrintf("server %v 读取快照失败: 无快照\n", rf.me)
+		return
+	}
+	rf.snapShot = data
+	DPrintf("server %v 读取快照c成功\n", rf.me)
 }
 
 // the service says it has created a snapshot that has
@@ -162,7 +218,27 @@ func (rf *Raft) readPersist(data []byte) {
 // that index. Raft should now trim its log as much as possible.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (3D).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 
+	if rf.commitIndex < index || index <= rf.lastIncludedIndex {
+		//首先我们保证快照保存的一定是已经committed了的index,所以commitIndex < index
+		//另外我们需要避免重复保存快照，所以要 index <= lastIncludedIndex
+		DPrintf("server %v 拒绝了 Snapshot 请求, 其index=%v, 自身commitIndex=%v, lastIncludedIndex=%v\n", rf.me, index, rf.commitIndex, rf.lastIncludedIndex)
+		return
+	}
+	DPrintf("server %v 同意了 Snapshot 请求, 其index=%v, 自身commitIndex=%v, 原来的lastIncludedIndex=%v, 快照后的lastIncludedIndex=%v\n", rf.me, index, rf.commitIndex, rf.lastIncludedIndex, index)
+
+	rf.snapShot = snapshot
+	rf.lastIncludedTerm = rf.log[rf.RealLogIdx(index)].Term
+
+	//截断log
+	rf.log = rf.log[rf.RealLogIdx(index):] //index位置的log保存在0索引处
+	rf.lastIncludedIndex = index
+	if rf.lastApplied < index {
+		rf.lastApplied = index
+	}
+	rf.persist()
 }
 
 // example RequestVote RPC handler.
@@ -299,6 +375,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 }
 
+func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
+
+}
+
 // example code to send a RequestVote RPC to a server.
 // server is the index of the target server in rf.peers[].
 // expects RPC arguments in args.
@@ -333,6 +413,11 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	return ok
+}
+
+func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotArgs, reply *InstallSnapshotReply) bool {
+	ok := rf.peers[server].Call("Raft.InstallSnapshot", args, reply)
 	return ok
 }
 
@@ -399,22 +484,66 @@ func (rf *Raft) SendHeartBeats() {
 				Term:         rf.currentTerm,
 				LeaderId:     rf.me,
 				PrevLogIndex: rf.nextIndex[peer] - 1,
-				PrevLogTerm:  rf.log[rf.nextIndex[peer]-1].Term,
 				LeaderCommit: rf.commitIndex,
 			}
-			if len(rf.log)-1 >= rf.nextIndex[peer] {
+			sendInstallSnapshot := false
+			if args.PrevLogIndex < rf.lastIncludedIndex {
+				DPrintf("leader %v 取消向 server %v 广播新的心跳, 改为发送sendInstallSnapshot, lastIncludedIndex=%v, nextIndex[%v]=%v, args = %+v \n", rf.me, i, rf.lastIncludedIndex, i, rf.nextIndex[i], args)
+				sendInstallSnapshot = true
+			} else if rf.VirtualLogIdx(len(rf.log)-1) >= rf.nextIndex[peer] {
 				//有新log需要发送
-				args.Entries = rf.log[rf.nextIndex[peer]:]
+				args.Entries = rf.log[rf.RealLogIdx(args.PrevLogIndex+1):]
 				DPrintf("leader %v 开始向 server %v 广播新的AppendEntries\n", rf.me, peer)
 			} else {
 				args.Entries = make([]Entry, 0)
 				DPrintf("leader %v 开始向 server %v 广播新的心跳, args = %+v \n", rf.me, peer, args)
 			}
-			go rf.handleHeartbeat(peer, args)
+			if sendInstallSnapshot {
+				go rf.handleInstallSnapshot(peer)
+			} else {
+				args.PrevLogTerm = rf.log[rf.RealLogIdx(args.PrevLogIndex)].Term
+				go rf.handleHeartbeat(peer, args)
+			}
+
 		}
 		rf.mu.Unlock()
 		rf.heartbeatTimer.Reset(GetStableHeartbeatInterval())
 	}
+}
+
+func (rf *Raft) handleInstallSnapshot(peer int) {
+	reply := &InstallSnapshotReply{}
+	rf.mu.Lock()
+	if rf.role != Leader {
+		rf.mu.Unlock()
+		return
+	}
+	args := &InstallSnapshotArgs{
+		Term:              rf.currentTerm,
+		LeaderId:          rf.me,
+		LastIncludedIndex: rf.lastIncludedIndex,
+		LastIncludedTerm:  rf.lastIncludedTerm,
+		Data:              rf.snapShot,
+		LastIncludedCmd:   rf.log[0].Command,
+	}
+	rf.mu.Unlock()
+
+	ok := rf.sendInstallSnapshot(peer, args, reply)
+	if !ok {
+		return
+	}
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	if reply.Term > rf.currentTerm {
+		rf.currentTerm = reply.Term
+		rf.role = Follower
+		rf.votedFor = -1
+		rf.elecTimer.Reset(GetRandomElecInterval())
+		rf.persist()
+		return
+	}
+	rf.nextIndex[peer] = rf.VirtualLogIdx(1)
 }
 
 func (rf *Raft) handleHeartbeat(peer int, args *AppendEntriesArgs) {
@@ -472,18 +601,36 @@ func (rf *Raft) handleHeartbeat(peer int, args *AppendEntriesArgs) {
 		// 将nextIndex自减再重试
 		if reply.XTerm == -1 {
 			//表示prelogindex在follwer中不存在
-			rf.nextIndex[peer] = reply.XLen
+			if rf.lastIncludedIndex >= reply.XLen {
+				//发现回退到lastIncludedIndex不能满足
+				go rf.handleInstallSnapshot(peer)
+			} else {
+				rf.nextIndex[peer] = reply.XLen
+			}
 			return
 		}
 		i := rf.nextIndex[peer] - 1
-		for i > 0 && rf.log[i].Term > reply.XTerm {
+		if i < rf.lastIncludedIndex {
+			i = rf.lastIncludedIndex
+		}
+		for i > rf.lastIncludedIndex && rf.log[rf.RealLogIdx(i)].Term > reply.XTerm {
 			i -= 1
 		}
-		if rf.log[i].Term == reply.XTerm {
-			// 之前PrevLogIndex发生冲突位置时, Follower的Term自己也有
+		if i == rf.lastIncludedIndex && rf.log[rf.RealLogIdx(i)].Term > reply.XTerm {
+			//还需要继续找，但是已经被snapshot截断
+			go rf.handleInstallSnapshot(peer)
+		} else if rf.log[rf.RealLogIdx(i)].Term == reply.XTerm {
 			rf.nextIndex[peer] = i + 1
 		} else {
-			rf.nextIndex[peer] = reply.XIndex
+			// 之前PrevLogIndex发生冲突位置时, Follower的Term自己没有
+			DPrintf("leader %v 收到 server %v 的回退请求, 冲突位置的Term为%v, server的这个Term从索引%v开始, 而leader对应的XTerm不存在, 回退前的nextIndex[%v]=%v, 回退后的nextIndex[%v]=%v\n", rf.me, serverTo, reply.XTerm, reply.XIndex, serverTo, rf.nextIndex[serverTo], serverTo, reply.XIndex)
+			if reply.XIndex <= rf.lastIncludedIndex {
+				// XIndex位置也被截断了
+				// 添加InstallSnapshot的处理
+				go rf.handleInstallSnapshot(peer)
+			} else {
+				rf.nextIndex[peer] = reply.XIndex
+			}
 		}
 	}
 }
@@ -640,7 +787,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.readPersist(persister.ReadRaftState())
 
 	for i := 0; i < len(rf.nextIndex); i++ {
-		rf.nextIndex[i] = len(rf.log) // raft中的index是从1开始的
+		rf.nextIndex[i] = rf.VirtualLogIdx(len(rf.log)) // raft中的index是从1开始的
 	}
 	// start ticker goroutine to start elections
 	go rf.ticker()
