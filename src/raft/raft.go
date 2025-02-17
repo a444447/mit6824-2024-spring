@@ -21,7 +21,6 @@ import (
 	//	"bytes"
 
 	"bytes"
-	"math"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -170,9 +169,10 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (3A, 3B).
 	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	DPrintf("server %v 收到来自%v的投票请求 term:%v", rf.me, args.CandidateId, rf.currentTerm)
 	if args.Term < rf.currentTerm {
 		reply.Term = rf.currentTerm
-		rf.mu.Unlock()
 		reply.VoteGranted = false
 		DPrintf("server %v 拒绝向 server %v投票: 旧的term: %v,\n\targs= %+v\n", rf.me, args.CandidateId, args.Term, args)
 		return
@@ -187,7 +187,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
 		if args.LastLogTerm > rf.log[len(rf.log)-1].Term ||
-			(args.LastLogIndex == rf.log[len(rf.log)-1].Term && args.LastLogIndex >= len(rf.log)-1) {
+			(args.LastLogTerm == rf.log[len(rf.log)-1].Term && args.LastLogIndex >= len(rf.log)-1) {
+			//debug的时候发现args.LastLogTerm写成LastLogIndex了，导致TestFollowerFailure3B过不了(原因是假设ABC三个服务器，产生分区A｜BC，当A reconnect后，它对其他服务器投票一直是不同意（毕竟我写错了)
+			//问题的关键是，由于A是不可能被同意的，但是它会不断term++,然后它不同意其他服务器的时候也会导致另一个服务器term++,最后的情况是没一个服务器能当选。
 			// 2. If votedFor is null or candidateId, and candidate’s log is least as up-to-date as receiver’s log, grant vote (§5.2, §5.4)
 
 			rf.votedFor = args.CandidateId
@@ -196,17 +198,21 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			rf.role = Follower
 			//收到消息后重置
 			rf.elecTimer.Reset(GetRandomElecInterval())
-			rf.mu.Unlock()
 			reply.VoteGranted = true
 			DPrintf("server %v 同意向 server %v投票\n\targs= %+v\n", rf.me, args.CandidateId, args)
 			rf.persist()
 			return
+		} else {
+			if args.LastLogTerm < rf.log[len(rf.log)-1].Term {
+				DPrintf("server %v 拒绝向 server %v 投票: 更旧的LastLogTerm, args = %+v\n", rf.me, args.CandidateId, args)
+			} else {
+				DPrintf("server %v 拒绝向 server %v 投票: 更短的Log, args = %+v\n", rf.me, args.CandidateId, args)
+			}
 		}
 	} else {
 		DPrintf("server %v 拒绝向 server %v投票: 已投票\n\targs= %+v\n", rf.me, args.CandidateId, args)
 	}
 	reply.Term = rf.currentTerm
-	rf.mu.Unlock()
 	reply.VoteGranted = false
 
 }
@@ -284,7 +290,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	reply.Term = rf.currentTerm
 	if args.LeaderCommit > rf.commitIndex {
 		// 5.If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
-		rf.commitIndex = int(math.Min(float64(args.LeaderCommit), float64(len(rf.log)-1)))
+		if args.LeaderCommit > len(rf.log)-1 {
+			rf.commitIndex = len(rf.log) - 1
+		} else {
+			rf.commitIndex = args.LeaderCommit
+		}
 	}
 
 }
@@ -480,20 +490,19 @@ func (rf *Raft) handleHeartbeat(peer int, args *AppendEntriesArgs) {
 
 func (rf *Raft) startElection() {
 	rf.mu.Lock()
-
+	defer rf.mu.Unlock()
 	rf.currentTerm += 1
 	rf.role = Candidate
 	rf.votedFor = rf.me
 	rf.voteCnt = 1
-	rf.elecTimer.Reset(GetRandomElecInterval()) //给自己投票也算消息
-
+	// rf.elecTimer.Reset(GetRandomElecInterval()) //给自己投票也算消息
+	DPrintf("server %v 开始发起新一轮投票, 新一轮的term为: %v", rf.me, rf.currentTerm)
 	args := &RequestVoteArgs{
 		Term:         rf.currentTerm,
 		CandidateId:  rf.me,
 		LastLogIndex: len(rf.log) - 1,
 		LastLogTerm:  rf.log[len(rf.log)-1].Term,
 	}
-	defer rf.mu.Unlock()
 	for peer := range rf.peers {
 		if peer == rf.me {
 			continue
@@ -539,6 +548,7 @@ func (rf *Raft) collectVote(serverTo int, args *RequestVoteArgs) {
 func (rf *Raft) GetVoteAnswer(server int, args *RequestVoteArgs) bool {
 	sendArgs := *args
 	reply := RequestVoteReply{}
+	DPrintf("server %v sendrequestVote to %v", rf.me, server)
 	ok := rf.sendRequestVote(server, &sendArgs, &reply)
 	if !ok {
 		return false
