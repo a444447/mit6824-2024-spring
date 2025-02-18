@@ -26,3 +26,9 @@ func GetRandomElecInterval() time.Duration {
 func GetStableHeartbeatInterval() time.Duration {
 	return time.Duration(baseHeartbeatInterval) * time.Millisecond
 }
+
+func GetRandomElectTimeOut(rd *rand.Rand) int {
+	plusMs := int(rd.Float64() * 500.0)
+
+	return plusMs + ElectTimeOutBase
+}
