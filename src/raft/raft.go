@@ -98,6 +98,7 @@ type Raft struct {
 	role           int
 	voteCnt        int
 	muVote         sync.Mutex
+	condApply      *sync.Cond
 
 	//snapshot
 	snapShot          []byte //快照
@@ -318,44 +319,58 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		DPrintf("server %v 收到 leader %v 的的AppendEntries: %+v \n", rf.me, args.LeaderId, args)
 	}
 	isConflict := false
-	//首先查看prevLogIndex位置是否存在日志项
-	if args.PrevLogIndex >= len(rf.log) {
-		//prevLogIndex不存在日志项
-		reply.Term = -1
-		reply.XLen = len(rf.log)
+	if args.PrevLogIndex < rf.lastIncludedIndex {
+		// 过时的RPC, 其 PrevLogIndex 甚至在lastIncludedIndex之前
+		reply.Success = true
+		reply.Term = rf.currentTerm
+		return
+	} else if args.PrevLogIndex >= rf.VirtualLogIdx(len(rf.log)) {
+		// PrevLogIndex位置不存在日志项
+		reply.XTerm = -1
+		reply.XLen = rf.VirtualLogIdx(len(rf.log)) // Log长度, 包括了已经snapShot的部分
 		isConflict = true
-	} else if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
-		//有日志，但是Term冲突
-		reply.Term = rf.log[args.PrevLogIndex].Term
+		DPrintf("server %v 的log在PrevLogIndex: %v 位置不存在日志项, Log长度为%v\n", rf.me, args.PrevLogIndex, reply.XLen)
+	} else if rf.log[rf.RealLogIdx(args.PrevLogIndex)].Term != args.PrevLogTerm {
+		// PrevLogIndex位置的日志项存在, 但term不匹配
+		reply.XTerm = rf.log[rf.RealLogIdx(args.PrevLogIndex)].Term
 		i := args.PrevLogIndex
-		for rf.log[i].Term == args.PrevLogTerm {
+		for i > rf.commitIndex && rf.log[rf.RealLogIdx(i)].Term == reply.XTerm {
 			i -= 1
 		}
 		reply.XIndex = i + 1
+		reply.XLen = rf.VirtualLogIdx(len(rf.log)) // Log长度, 包括了已经snapShot的部分
 		isConflict = true
-
+		DPrintf("server %v 的log在PrevLogIndex: %v 位置Term不匹配, args.Term=%v, 实际的term=%v\n", rf.me, args.PrevLogIndex, args.PrevLogTerm, reply.XTerm)
 	}
 	if isConflict {
 		reply.Term = rf.currentTerm
 		reply.Success = false
 		return
 	}
-	// if args.PrevLogIndex >= len(rf.log) || rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
-	// 	reply.Term = rf.currentTerm
-	// 	reply.Success = false
-	// 	return
-	// }
 
 	// 3. If an existing entry conflicts with a new one (same index
 	// but different terms), delete the existing entry and all that
 	// follow it (§5.3)
-	if len(args.Entries) != 0 && len(rf.log) > args.PrevLogIndex+1 {
-		DPrintf("server %v 的log与args发生冲突, 进行移除\n", rf.me)
-		rf.log = rf.log[:args.PrevLogIndex+1]
+	// if len(args.Entries) != 0 && len(rf.log) > args.PrevLogIndex+1 {
+	// 	DPrintf("server %v 的log与args发生冲突, 进行移除\n", rf.me)
+	// 	rf.log = rf.log[:args.PrevLogIndex+1]
+	// }
+	for idx, log := range args.Entries {
+		ridx := rf.RealLogIdx(args.PrevLogIndex) + 1 + idx
+		if ridx < len(rf.log) && rf.log[ridx].Term != log.Term {
+			// 某位置发生了冲突, 覆盖这个位置开始的所有内容
+			rf.log = rf.log[:ridx]
+			rf.log = append(rf.log, args.Entries[idx:]...)
+			break
+		} else if ridx == len(rf.log) {
+			// 没有发生冲突但长度更长了, 直接拼接
+			rf.log = append(rf.log, args.Entries[idx:]...)
+			break
+		}
 	}
 	// 4. Append any new entries not already in the log
 	// 补充apeend的业务
-	rf.log = append(rf.log, args.Entries...)
+	// rf.log = append(rf.log, args.Entries...)
 	rf.persist()
 	if len(args.Entries) != 0 {
 		// DPrintf("server %v 成功进行apeend, log: %+v\n", rf.me, rf.log)
@@ -371,12 +386,66 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		} else {
 			rf.commitIndex = args.LeaderCommit
 		}
+		rf.condApply.Signal()
 	}
 
 }
 
 func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
+	rf.mu.Lock()
+	defer func() {
+		rf.elecTimer.Reset(GetRandomElecInterval())
+		rf.mu.Unlock()
+	}()
+	if args.Term < rf.currentTerm {
+		reply.Term = rf.currentTerm
+		DPrintf("server %v 拒绝来自 %v 的 InstallSnapshot, 更小的Term\n", rf.me, args.LeaderId)
+		return
+	}
+	if args.Term > rf.currentTerm {
+		rf.currentTerm = args.Term
+		rf.votedFor = -1
+		//rf.persist()
+	}
+	rf.role = Follower
+	//判断rf.log中是否包含了lastIncludedIndex.如果包含了，那么我们只需要留下[lastIncludedIndex:]的部分；否则清空rf.log(因为这部分日志已经全部保存在快照)
+	hasEntry := false
+	rIdx := 0
+	for ; rIdx < len(rf.log); rIdx++ {
+		if rf.VirtualLogIdx(rIdx) == args.LastIncludedIndex && rf.log[rIdx].Term == args.LastIncludedTerm {
+			hasEntry = true
+			break
+		}
+	}
 
+	msg := &ApplyMsg{
+		SnapshotValid: true,
+		Snapshot:      args.Data,
+		SnapshotTerm:  args.LastIncludedTerm,
+		SnapshotIndex: args.LastIncludedIndex,
+	}
+	if hasEntry {
+		DPrintf("server %v InstallSnapshot: args.LastIncludedIndex= %v 位置存在, 保留后面的log\n", rf.me, args.LastIncludedIndex)
+		rf.log = rf.log[rIdx:]
+	} else {
+		DPrintf("server %v InstallSnapshot: 清空log\n", rf.me)
+		rf.log = make([]Entry, 0)
+		rf.log = append(rf.log, Entry{Term: rf.lastIncludedTerm, Command: args.LastIncludedCmd}) //占位index0
+	}
+	rf.snapShot = args.Data
+	rf.lastIncludedIndex = args.LastIncludedIndex
+	rf.lastIncludedTerm = args.LastIncludedTerm
+	//当调用了InstallSnapshot后，我们认为包括lastIncludedIndex在内的之前的所有Index都已经是被committed与应用到状态机了
+	//所以我们要更新commitIndex与lastApplied
+	if rf.commitIndex < args.LastIncludedIndex {
+		rf.commitIndex = args.LastIncludedIndex
+	}
+	if rf.lastApplied < args.LastIncludedIndex {
+		rf.lastApplied = args.LastIncludedIndex
+	}
+	reply.Term = rf.currentTerm
+	rf.applyCh <- *msg
+	rf.persist()
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -488,7 +557,7 @@ func (rf *Raft) SendHeartBeats() {
 			}
 			sendInstallSnapshot := false
 			if args.PrevLogIndex < rf.lastIncludedIndex {
-				DPrintf("leader %v 取消向 server %v 广播新的心跳, 改为发送sendInstallSnapshot, lastIncludedIndex=%v, nextIndex[%v]=%v, args = %+v \n", rf.me, i, rf.lastIncludedIndex, i, rf.nextIndex[i], args)
+				DPrintf("leader %v 取消向 server %v 广播新的心跳, 改为发送sendInstallSnapshot, lastIncludedIndex=%v, nextIndex[%v]=%v, args = %+v \n", rf.me, peer, rf.lastIncludedIndex, peer, rf.nextIndex[peer], args)
 				sendInstallSnapshot = true
 			} else if rf.VirtualLogIdx(len(rf.log)-1) >= rf.nextIndex[peer] {
 				//有新log需要发送
@@ -564,7 +633,7 @@ func (rf *Raft) handleHeartbeat(peer int, args *AppendEntriesArgs) {
 		rf.nextIndex[peer] = rf.matchIndex[peer] + 1
 
 		// 需要判断是否可以commit
-		N := len(rf.log) - 1
+		N := rf.VirtualLogIdx(len(rf.log) - 1)
 
 		for N > rf.commitIndex {
 			count := 1 // 1表示包括了leader自己
@@ -583,6 +652,8 @@ func (rf *Raft) handleHeartbeat(peer int, args *AppendEntriesArgs) {
 			}
 			N -= 1
 		}
+		rf.condApply.Signal()
+
 		return
 	}
 
@@ -623,7 +694,7 @@ func (rf *Raft) handleHeartbeat(peer int, args *AppendEntriesArgs) {
 			rf.nextIndex[peer] = i + 1
 		} else {
 			// 之前PrevLogIndex发生冲突位置时, Follower的Term自己没有
-			DPrintf("leader %v 收到 server %v 的回退请求, 冲突位置的Term为%v, server的这个Term从索引%v开始, 而leader对应的XTerm不存在, 回退前的nextIndex[%v]=%v, 回退后的nextIndex[%v]=%v\n", rf.me, serverTo, reply.XTerm, reply.XIndex, serverTo, rf.nextIndex[serverTo], serverTo, reply.XIndex)
+			DPrintf("leader %v 收到 server %v 的回退请求, 冲突位置的Term为%v, server的这个Term从索引%v开始, 而leader对应的XTerm不存在, 回退前的nextIndex[%v]=%v, 回退后的nextIndex[%v]=%v\n", rf.me, peer, reply.XTerm, reply.XIndex, peer, rf.nextIndex[peer], peer, reply.XIndex)
 			if reply.XIndex <= rf.lastIncludedIndex {
 				// XIndex位置也被截断了
 				// 添加InstallSnapshot的处理
@@ -722,18 +793,51 @@ func (rf *Raft) GetVoteAnswer(server int, args *RequestVoteArgs) bool {
 func (rf *Raft) commitChecker() {
 	for !rf.killed() {
 		rf.mu.Lock()
-		for rf.commitIndex > rf.lastApplied {
-			rf.lastApplied += 1
+		// DPrintf("server %v CommitChecker 获取锁mu", rf.me)
+		for rf.commitIndex <= rf.lastApplied {
+			rf.condApply.Wait()
+		}
+		msgBuf := make([]*ApplyMsg, 0, rf.commitIndex-rf.lastApplied)
+		tmpApplied := rf.lastApplied
+		for rf.commitIndex > tmpApplied {
+			tmpApplied += 1
+			if tmpApplied <= rf.lastIncludedIndex {
+				// tmpApplied可能是snapShot中已经被截断的日志项, 这些日志项就不需要再发送了
+				continue
+			}
 			msg := &ApplyMsg{
 				CommandValid: true,
-				Command:      rf.log[rf.lastApplied].Command,
-				CommandIndex: rf.lastApplied,
+				Command:      rf.log[rf.RealLogIdx(tmpApplied)].Command,
+				CommandIndex: tmpApplied,
+				SnapshotTerm: rf.log[rf.RealLogIdx(tmpApplied)].Term,
 			}
-			rf.applyCh <- *msg
-			DPrintf("server %v 准备将命令 %v(索引为 %v ) 应用到状态机\n", rf.me, msg.Command, msg.CommandIndex)
+
+			msgBuf = append(msgBuf, msg)
 		}
 		rf.mu.Unlock()
-		time.Sleep(time.Duration(baseCommitCheckInterval))
+
+		// 注意, 在解锁后可能又出现了SnapShot进而修改了rf.lastApplied
+		for _, msg := range msgBuf {
+			rf.mu.Lock()
+			if msg.CommandIndex != rf.lastApplied+1 {
+				rf.mu.Unlock()
+				continue
+			}
+			DPrintf("server %v 准备commit, log = %v:%v, lastIncludedIndex=%v", rf.me, msg.CommandIndex, msg.SnapshotTerm, rf.lastIncludedIndex)
+
+			rf.mu.Unlock()
+			// 注意, 在解锁后可能又出现了SnapShot进而修改了rf.lastApplied
+
+			rf.applyCh <- *msg
+
+			rf.mu.Lock()
+			if msg.CommandIndex != rf.lastApplied+1 {
+				rf.mu.Unlock()
+				continue
+			}
+			rf.lastApplied = msg.CommandIndex
+			rf.mu.Unlock()
+		}
 	}
 }
 
@@ -781,9 +885,11 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.elecTimer = time.NewTimer(0)
 	rf.heartbeatTimer = time.NewTimer(0)
 	rf.elecTimer.Reset(GetRandomElecInterval())
+	rf.condApply = sync.NewCond(&rf.mu)
 	// Your initialization code here (3A, 3B, 3C).
 
 	// initialize from state persisted before a crash
+	rf.readSnapshot(persister.ReadSnapshot())
 	rf.readPersist(persister.ReadRaftState())
 
 	for i := 0; i < len(rf.nextIndex); i++ {
