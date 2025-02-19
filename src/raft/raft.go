@@ -274,6 +274,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	// DPrintf("server %v Start 获取锁mu", rf.me)
 	defer func() {
 		// DPrintf("server %v Start 释放锁mu", rf.me)
+		rf.ResetHeartTimer(15)
 		rf.mu.Unlock()
 	}()
 	if rf.role != Leader {
@@ -284,10 +285,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.log = append(rf.log, *newEntry)
 	DPrintf("leader %v 准备持久化", rf.me)
 	rf.persist()
-
-	defer func() {
-		rf.ResetHeartTimer(1)
-	}()
 
 	return rf.VirtualLogIdx(len(rf.log) - 1), rf.currentTerm, true
 }
@@ -394,6 +391,13 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	rf.ResetVoteTimer()
 	DPrintf("server %v 接收到 leader %v 的InstallSnapshot, 重设定时器", rf.me, args.LeaderId)
 
+	if args.LastIncludedIndex < rf.lastIncludedIndex || args.LastIncludedIndex < rf.commitIndex {
+		// 1. 快照反而比当前的 lastIncludedIndex 更旧, 不需要快照
+		// 2. 快照比当前的 commitIndex 更旧, 不能安装快照
+		reply.Term = rf.currentTerm
+		return
+	}
+
 	// 6. If existing log entry has same index and term as snapshot’s last included entry, retain log entries following it and reply
 	hasEntry := false
 	rIdx := 0
@@ -479,6 +483,11 @@ func (rf *Raft) handleInstallSnapshot(serverTo int) {
 		rf.mu.Unlock()
 	}()
 
+	if rf.role != Leader || rf.currentTerm != args.Term {
+		// 已经不是Leader或者是过期的Leader
+		return
+	}
+
 	if reply.Term > rf.currentTerm {
 		// 自己是旧Leader
 		rf.currentTerm = reply.Term
@@ -489,7 +498,11 @@ func (rf *Raft) handleInstallSnapshot(serverTo int) {
 		return
 	}
 
-	rf.nextIndex[serverTo] = rf.VirtualLogIdx(1)
+	// LastIncludedIndex可能包括了还没有复制的日志项, 这些日志项可以不用复制了
+	if rf.matchIndex[serverTo] < args.LastIncludedIndex {
+		rf.matchIndex[serverTo] = args.LastIncludedIndex
+	}
+	rf.nextIndex[serverTo] = rf.matchIndex[serverTo] + 1
 }
 
 func (rf *Raft) sendAppendEntries(serverTo int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
@@ -544,7 +557,12 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	// 校验PrevLogIndex和PrevLogTerm不合法
 	// 2. Reply false if log doesn’t contain an entry at prevLogIndex whose term matches prevLogTerm (§5.3)
-	if args.PrevLogIndex >= rf.VirtualLogIdx(len(rf.log)) {
+	if args.PrevLogIndex < rf.lastIncludedIndex {
+		// 过时的RPC, 其 PrevLogIndex 甚至在lastIncludedIndex之前
+		reply.Success = true
+		reply.Term = rf.currentTerm
+		return
+	} else if args.PrevLogIndex >= rf.VirtualLogIdx(len(rf.log)) {
 		// PrevLogIndex位置不存在日志项
 		reply.XTerm = -1
 		reply.XLen = rf.VirtualLogIdx(len(rf.log)) // Log长度, 包括了已经snapShot的部分
@@ -554,7 +572,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		// PrevLogIndex位置的日志项存在, 但term不匹配
 		reply.XTerm = rf.log[rf.RealLogIdx(args.PrevLogIndex)].Term
 		i := args.PrevLogIndex
-		for i > rf.lastIncludedIndex && rf.log[rf.RealLogIdx(i)].Term == reply.XTerm {
+		for i > rf.commitIndex && rf.log[rf.RealLogIdx(i)].Term == reply.XTerm {
 			i -= 1
 		}
 		reply.XIndex = i + 1
@@ -628,7 +646,7 @@ func (rf *Raft) handleAppendEntries(serverTo int, args *AppendEntriesArgs) {
 		rf.mu.Unlock()
 	}()
 
-	if args.Term != rf.currentTerm {
+	if rf.role != Leader || args.Term != rf.currentTerm {
 		// 函数调用间隙值变了, 已经不是发起这个调用时的term了
 		// 要先判断term是否改变, 否则后续的更改matchIndex等是不安全的
 		return
@@ -638,15 +656,11 @@ func (rf *Raft) handleAppendEntries(serverTo int, args *AppendEntriesArgs) {
 		// server回复成功
 		newMatchIdx := args.PrevLogIndex + len(args.Entries)
 		if newMatchIdx > rf.matchIndex[serverTo] {
-			// 有可能在此期间安装了快照, 导致 rf.matchIndex[serverTo] 本来就更大
+			// 有可能在此期间让follower安装了快照, 导致 rf.matchIndex[serverTo] 本来就更大
 			rf.matchIndex[serverTo] = newMatchIdx
 		}
 
-		newNextIdx := args.PrevLogIndex + len(args.Entries) + 1
-		if newNextIdx > rf.nextIndex[serverTo] {
-			// 有可能在此期间安装了快照, 导致 rf.nextIndex[serverTo] 本来就更大
-			rf.nextIndex[serverTo] = newNextIdx
-		}
+		rf.nextIndex[serverTo] = rf.matchIndex[serverTo] + 1
 
 		// 需要判断是否可以commit
 		N := rf.VirtualLogIdx(len(rf.log) - 1)
@@ -699,8 +713,8 @@ func (rf *Raft) handleAppendEntries(serverTo int, args *AppendEntriesArgs) {
 			DPrintf("leader %v 收到 server %v 的回退请求, 原因是log过短, 回退前的nextIndex[%v]=%v, 回退后的nextIndex[%v]=%v\n", rf.me, serverTo, serverTo, rf.nextIndex[serverTo], serverTo, reply.XLen)
 			if rf.lastIncludedIndex >= reply.XLen {
 				// 由于snapshot被截断
-				// 添加InstallSnapshot的处理
-				go rf.handleInstallSnapshot(serverTo)
+				// 下一次心跳添加InstallSnapshot的处理
+				rf.nextIndex[serverTo] = rf.lastIncludedIndex
 			} else {
 				rf.nextIndex[serverTo] = reply.XLen
 			}
@@ -721,8 +735,8 @@ func (rf *Raft) handleAppendEntries(serverTo int, args *AppendEntriesArgs) {
 
 		if i == rf.lastIncludedIndex && rf.log[rf.RealLogIdx(i)].Term > reply.XTerm {
 			// 要找的位置已经由于snapshot被截断
-			// 添加InstallSnapshot的处理
-			go rf.handleInstallSnapshot(serverTo)
+			// 下一次心跳添加InstallSnapshot的处理
+			rf.nextIndex[serverTo] = rf.lastIncludedIndex
 		} else if rf.log[rf.RealLogIdx(i)].Term == reply.XTerm {
 			// 之前PrevLogIndex发生冲突位置时, Follower的Term自己也有
 
@@ -734,7 +748,7 @@ func (rf *Raft) handleAppendEntries(serverTo int, args *AppendEntriesArgs) {
 			if reply.XIndex <= rf.lastIncludedIndex {
 				// XIndex位置也被截断了
 				// 添加InstallSnapshot的处理
-				go rf.handleInstallSnapshot(serverTo)
+				rf.nextIndex[serverTo] = rf.lastIncludedIndex
 			} else {
 				rf.nextIndex[serverTo] = reply.XIndex
 			}
@@ -908,7 +922,7 @@ func (rf *Raft) GetVoteAnswer(server int, args *RequestVoteArgs) bool {
 		rf.mu.Unlock()
 	}()
 
-	if sendArgs.Term != rf.currentTerm {
+	if rf.role != Candidate || sendArgs.Term != rf.currentTerm {
 		// 易错点: 函数调用的间隙被修改了
 		return false
 	}
@@ -938,7 +952,7 @@ func (rf *Raft) collectVote(serverTo int, args *RequestVoteArgs, muVote *sync.Mu
 	if *voteCount > len(rf.peers)/2 {
 		rf.mu.Lock()
 		// DPrintf("server %v collectVote 获取锁mu", rf.me)
-		if rf.role == Follower || rf.currentTerm != args.Term {
+		if rf.role != Candidate || rf.currentTerm != args.Term {
 			// 有另外一个投票的协程收到了更新的term而更改了自身状态为Follower
 			// 或者自己的term已经过期了, 也就是被新一轮的选举追上了
 			rf.mu.Unlock()
@@ -976,7 +990,9 @@ func (rf *Raft) Elect() {
 	rf.currentTerm += 1 // 自增term
 	rf.role = Candidate // 成为候选人
 	rf.votedFor = rf.me // 给自己投票
-	voteCount := 1      // 自己有一票
+	rf.persist()
+
+	voteCount := 1 // 自己有一票
 	var muVote sync.Mutex
 
 	DPrintf("server %v 开始发起新一轮投票, 新一轮的term为: %v", rf.me, rf.currentTerm)
