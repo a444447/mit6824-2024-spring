@@ -1,12 +1,14 @@
 package kvraft
 
 import (
-	"6.5840/labgob"
-	"6.5840/labrpc"
-	"6.5840/raft"
 	"log"
 	"sync"
 	"sync/atomic"
+	"time"
+
+	"6.5840/labgob"
+	"6.5840/labrpc"
+	"6.5840/raft"
 )
 
 const Debug = false
@@ -18,11 +20,25 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
+const HandleOpTimeout int = 500
+
+type OpType int
+
+const (
+	OpGET = iota
+	OpPUT
+	OpAPPEND
+)
 
 type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+	Seq        uint64
+	Key        string
+	Val        string
+	Identifier int64
+	Type       OpType
 }
 
 type KVServer struct {
@@ -35,19 +51,222 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
+	waitCh     map[int]*chan result //记录那些等待commit回复的RPC handler 通道
+	historyMap map[int64]*result    //映射 Identifier->*result
+	maxMapLen  int
+	db         map[string]string
 }
 
+type result struct {
+	LastSeq uint64
+	Err     Err
+	Value   string
+	ResTerm int //commit被apply的时候的term
+}
 
+// 下面的RPC handler逻辑都是: 收到client的rpc请求，然后就调用start来与raft层互动，等待commit
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
+	//先判断是不是leader
+	_, isLeader := kv.rf.GetState()
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+	opArgs := &Op{Type: OpGET, Seq: args.Seq, Key: args.Key, Identifier: args.Identifier}
+	res := kv.HandleOp(opArgs)
+	reply.Err = res.Err
+	reply.Value = res.Value
+}
+
+func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
+	// Your code here.
+	// 先判断是不是leader
+	_, isLeader := kv.rf.GetState()
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+
+	opArgs := &Op{Seq: args.Seq, Key: args.Key, Val: args.Value, Identifier: args.Identifier}
+	if args.Op == "Put" {
+		opArgs.Type = OpPUT
+	} else {
+		opArgs.Type = OpAPPEND
+	}
+
+	res := kv.HandleOp(opArgs)
+	reply.Err = res.Err
 }
 
 func (kv *KVServer) Put(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
+
 }
 
 func (kv *KVServer) Append(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
+}
+
+func (kv *KVServer) HandleOp(opArgs *Op) (res result) {
+	startIndex, startTerm, isLeader := kv.rf.Start(*opArgs)
+	if !isLeader {
+		return result{Err: ErrWrongLeader, Value: ""}
+	}
+	kv.mu.Lock()
+	newCh := make(chan result)
+	kv.waitCh[startIndex] = &newCh //直接覆盖之前记录的chan
+	kv.mu.Unlock()
+
+	defer func() {
+		//返回时删除waitCh中记录
+		kv.mu.Lock()
+		delete(kv.waitCh, startIndex)
+		close(newCh)
+		kv.mu.Unlock()
+	}()
+	//等待消息到达或者超时
+	select {
+	case <-time.After(time.Duration(HandleOpTimeout)):
+		res.Err = ErrHandleTimeout
+		return
+	case msg, success := <-newCh:
+		if success && msg.ResTerm == startTerm {
+			res = msg
+			return
+		} else if !success {
+			// 通道已经关闭, 有另一个协程收到了消息 或 通道被更新的RPC覆盖
+			// TODO: 是否需要判断消息到达时自己已经不是leader了?
+			DPrintf("server %v identifier %v Seq %v: 通道已经关闭, 有另一个协程收到了消息 或 更新的RPC覆盖, args.OpType=%v, args.Key=%+v", kv.me, opArgs.Identifier, opArgs.Seq, opArgs.Type, opArgs.Key)
+			res.Err = ErrChanClose
+			return
+		} else {
+			// term与一开始不匹配, 说明这个Leader可能过期了
+			DPrintf("server %v identifier %v Seq %v: term与一开始不匹配, 说明这个Leader可能过期了, res.ResTerm=%v, startTerm=%+v", kv.me, opArgs.Identifier, opArgs.Seq, res.ResTerm, startTerm)
+			res.Err = ErrWrongLeader
+			res.Value = ""
+			return
+		}
+	}
+}
+
+func (kv *KVServer) ApplyHandler() {
+	for !kv.killed() {
+		log := <-kv.applyCh
+		if log.CommandValid {
+			op := log.Command.(Op)
+			kv.mu.Lock()
+			var res result //判断这个log是否需要被再次应用
+			needApply := false
+			if hisMap, exist := kv.historyMap[op.Identifier]; exist {
+				if hisMap.LastSeq == op.Seq {
+					//历史记录的seq与log的seq相同，那么是重复的，直接返回历史
+					res = *hisMap
+				} else if hisMap.LastSeq < op.Seq {
+					needApply = true
+				} else {
+					//如果不存在
+					needApply = true
+				}
+			}
+			_, isLeader := kv.rf.GetState()
+			if needApply {
+				// 执行log
+				res = kv.DBExecute(&op, isLeader)
+				res.ResTerm = log.SnapshotTerm
+
+				// 更新历史记录
+				kv.historyMap[op.Identifier] = &res
+			}
+
+			if !isLeader {
+				kv.mu.Unlock()
+				continue
+			}
+			ch, exist := kv.waitCh[log.CommandIndex]
+			if !exist {
+				// 接收端的通道已经被删除了并且当前节点是 leader, 说明这是重复的请求, 但这种情况不应该出现, 所以panic
+				DPrintf("leader %v ApplyHandler 发现 identifier %v Seq %v 的管道不存在, 应该是超时被关闭了", kv.me, op.Identifier, op.Seq)
+				kv.mu.Unlock()
+				continue
+			}
+			kv.mu.Unlock()
+			// 发送消息
+			func() {
+				defer func() {
+					if recover() != nil {
+						// 如果这里有 panic，是因为通道关闭
+						DPrintf("leader %v ApplyHandler 发现 identifier %v Seq %v 的管道不存在, 应该是超时被关闭了", kv.me, op.Identifier, op.Seq)
+					}
+				}()
+				res.ResTerm = log.SnapshotTerm
+				*ch <- res
+			}()
+		}
+	}
+}
+
+func (kv *KVServer) LogInfoDBExecute(opArgs *Op, err Err, res string, isLeader bool) {
+	role := "follwer"
+	if isLeader {
+		role = "leader"
+	}
+	switch opArgs.Type {
+	case OpGET:
+		if err != "" {
+			DPrintf("%s %v identifier %v Seq %v DB执行Get请求: Get(%v), Err=%s\n", role, kv.me, opArgs.Identifier, opArgs.Seq, opArgs.Key, err)
+		} else {
+			DPrintf("%s %v identifier %v Seq %v DB执行Get请求: Get(%v), res=%s\n", role, kv.me, opArgs.Identifier, opArgs.Seq, opArgs.Key, res)
+		}
+	case OpPUT:
+		if err != "" {
+			DPrintf("%s %v identifier %v Seq %v DB执行Put请求: Put(%v,%v), Err=%s\n", role, kv.me, opArgs.Identifier, opArgs.Seq, opArgs.Key, opArgs.Val, err)
+
+		} else {
+			DPrintf("%s %v identifier %v Seq %v DB执行Put请求: Put(%v,%v), res=%s\n", role, kv.me, opArgs.Identifier, opArgs.Seq, opArgs.Key, opArgs.Val, res)
+		}
+	case OpAPPEND:
+		if err != "" {
+			DPrintf("%s %v identifier %v Seq %v DB执行Append请求: Put(%v,%v), Err=%s\n", role, kv.me, opArgs.Identifier, opArgs.Seq, opArgs.Key, opArgs.Val, err)
+		} else {
+			DPrintf("%s %v identifier %v Seq %v DB执行Append请求: Put(%v,%v), res=%s\n", role, kv.me, opArgs.Identifier, opArgs.Seq, opArgs.Key, opArgs.Val, res)
+		}
+	}
+}
+
+func (kv *KVServer) DBExecute(op *Op, isLeader bool) (res result) {
+	// 调用该函数需要持有锁
+	res.LastSeq = op.Seq
+	switch op.Type {
+	case OpGET:
+		val, exist := kv.db[op.Key]
+		if exist {
+			kv.LogInfoDBExecute(op, "", val, isLeader)
+			res.Value = val
+			return
+		} else {
+			res.Err = ErrNoKey
+			res.Value = ""
+			kv.LogInfoDBExecute(op, "", ErrNoKey, isLeader)
+			return
+		}
+	case OpPUT:
+		kv.db[op.Key] = op.Val
+		kv.LogInfoDBExecute(op, "", kv.db[op.Key], isLeader)
+		return
+	case OpAPPEND:
+		val, exist := kv.db[op.Key]
+		if exist {
+			kv.db[op.Key] = val + op.Val
+			kv.LogInfoDBExecute(op, "", kv.db[op.Key], isLeader)
+			return
+		} else {
+			kv.db[op.Key] = op.Val
+			kv.LogInfoDBExecute(op, "", kv.db[op.Key], isLeader)
+			return
+		}
+	}
+	return
 }
 
 // the tester calls Kill() when a KVServer instance won't
@@ -96,6 +315,10 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	// You may need initialization code here.
+	kv.historyMap = make(map[int64]*result)
+	kv.db = make(map[string]string)
+	kv.waitCh = make(map[int]*chan result)
 
+	go kv.ApplyHandler()
 	return kv
 }
